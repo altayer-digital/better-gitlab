@@ -1,0 +1,8 @@
+.DS_Store
+.idea/
+.next/
+node_modules/
+__coverage__/
+.history/
+config/user.yml
+notes
