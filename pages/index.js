@@ -19,8 +19,11 @@ class App extends React.PureComponent {
 && !mr.hasUnresolvedDiscussions
 && !mr.upVotedByMe`,
     }, {
-      name: 'Has unresolved discussions',
-      script: '!!mr.hasUnresolvedDiscussions'
+      name: 'Unresolved comments done',
+      script: `!!mr.hasUnresolvedDiscussions && this.get(mr, 'JIRA.status', '') === 'In Code Review'`
+    }, {
+      name: 'Unresolved comments pending',
+      script: `!!mr.hasUnresolvedDiscussions && this.get(mr, 'JIRA.status', '') !== 'In Code Review'`
     }, {
       name: 'Has my blessing',
       script: '!!mr.upVotedByMe'

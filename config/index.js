@@ -25,4 +25,3 @@ nconfProvider.file('app-default', {
 
 
 module.exports = nconfProvider.get();
-

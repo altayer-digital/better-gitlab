@@ -6,3 +6,5 @@ __coverage__/
 .history/
 config/user.yml
 notes
+chrome-extension/App*
+

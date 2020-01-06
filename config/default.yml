@@ -9,6 +9,9 @@ JIRAWebBaseURL: ''
 JIRAAPIToken: ''
 JIRAUser: ''
 
+togglBaseURL: 'https://www.toggl.com/api/v8/'
+togglAPIToken: ''
+
 redisSessionStore:
   host: 'localhost'
   port: 6379

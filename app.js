@@ -6,6 +6,7 @@ const next = require('next');
 const express = require('express');
 const expressSession = require('express-session');
 const RedisStore = require('connect-redis')(expressSession);
+const cors = require('cors');
 require('express-async-errors');
 const bodyParser = require('body-parser');
 const qs = require('qs');
@@ -21,6 +22,8 @@ const {
   JIRAAPIBaseURL,
   JIRAUser,
   JIRAAPIToken,
+  togglAPIToken,
+  togglBaseURL,
 } = require('./config');
 
 const JIRABasicAuthToken = Buffer.from(`${JIRAUser}:${JIRAAPIToken}`).toString('base64');
@@ -39,7 +42,17 @@ const gitlabClient = axios.create({
   },
 });
 
+const basicAuthToken = Buffer.from(`${togglAPIToken}:api_token`).toString('base64');
+const togglClient = axios.create({
+  baseURL: togglBaseURL,
+  headers: {
+    Authorization: `Basic ${basicAuthToken}`,
+  },
+});
+
 const app = express();
+
+app.use(cors());
 
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({
@@ -73,10 +86,15 @@ const fromAuthor = ({
   authorUrl,
 });
 
+const JIRAIssueKeyRegExp = /[A-Z]{2,}\-\d+/g;
+
+app.get('/projects', async (req, res) => {
+  const { data: projects } = await gitlabClient.get('/projects?per_page=100&page=1');
+  res.json(projects);
+});
+
 app.get('/mrs', async (req, res) => {
   const { data: mrs } = await gitlabClient.get(`/projects/${gitlabProjectId}/merge_requests?state=opened&per_page=100&page=1`);
-
-  const JIRAIssueKeyRegExp = /(OWEB|ONOS|ONA)\-\d+/g;
 
   const mrsFormatted = mrs
     .filter(({
@@ -197,13 +215,14 @@ app.get('/issues', async (req, res) => {
   const { data: { issues } } = await JIRAClient.get('/search', {
     params: {
       jql: `key in ('${issueKeys}')`,
+      expand: 'changelog',
       fields: 'priority,summary,status,issuetype,created,assignee,reporter,timespent',
     },
   });
 
   const byJIRATicketId = _(issues)
     .map(({
-      key: JIRATicketId,
+      key,
       fields: {
         summary,
         reporter,
@@ -216,18 +235,28 @@ app.get('/issues', async (req, res) => {
         timespent: timeSpent,
         created: createdAt,
       },
-    }) => ({
-      JIRATicketId,
-      webUrl: `${JIRAWebBaseURL}/browse/${JIRATicketId}`,
-      reporter,
-      assignee,
-      summary,
-      issueType,
-      status,
-      priority,
-      timeSpent,
-      createdAt,
-    }))
+      changelog,
+    }) => {
+      const movedKey = _(changelog.histories)
+        .flatMap('items')
+        .filter(['field', 'Key'])
+        .map('fromString')
+        .intersection(req.query.mrs)
+        .head();
+
+      return {
+        JIRATicketId: movedKey || key,
+        webUrl: `${JIRAWebBaseURL}/browse/${key}`,
+        reporter,
+        assignee,
+        summary,
+        issueType,
+        status,
+        priority,
+        timeSpent,
+        createdAt,
+      };
+    })
     .groupBy('JIRATicketId')
     .mapValues(([issue]) => issue)
     .value();
@@ -236,11 +265,177 @@ app.get('/issues', async (req, res) => {
   res.json(byJIRATicketId);
 });
 
+app.get('/sync', async (req, res) => {
+  const { data: diff } = await gitlabClient.get(`/projects/${gitlabProjectId}/repository/compare?from=master&to=beta`);
+  const onBetaAsPerGit = _(diff.commits)
+    .map(({ title }) => {
+      const [JIRAIssueKey] = title.match(JIRAIssueKeyRegExp) || [];
+      return JIRAIssueKey;
+    })
+    .filter(Boolean)
+    .uniq()
+    .value();
+
+  const { data: { issues } } = await JIRAClient.get('/search', {
+    params: {
+      jql: 'labels = "beta"',
+      fields: 'status',
+      expand: 'changelog',
+    },
+  });
+  const onBetaAsPerJIRA = issues.map(({ key, changelog }) => {
+    const { fromString = '' } = _(changelog.histories)
+      .flatMap('items')
+      .find(['field', 'Key']) || {};
+
+    return fromString || key;
+  });
+
+  const issueKeysToAddNextLabel = _.difference(onBetaAsPerGit, onBetaAsPerJIRA);
+  const issueKeysToRemoveNextLabel = _.difference(onBetaAsPerJIRA, onBetaAsPerGit);
+
+  await bluebird.map(issueKeysToAddNextLabel, async key => JIRAClient.put(`/issue/${key}`, {
+    update: {
+      labels: [
+        { add: 'nis-beta' },
+      ],
+    },
+  }), { concurrency: 5 });
+
+  res.json({
+    onBetaAsPerGit, onBetaAsPerJIRA, issueKeysToAddNextLabel, issueKeysToRemoveNextLabel,
+  });
+});
+
+const stopRunningTimeEntry = async ({ description } = {}) => {
+  const { data: { data: { id: timeEntryId } } } = await togglClient.get('/time_entries/current');
+  if (description) {
+    await togglClient.put(`/time_entries/${timeEntryId}`, {
+      time_entry: {
+        description,
+      },
+    });
+  }
+  const { data: timeEntry } = await togglClient.put(`/time_entries/${timeEntryId}/stop`);
+  return timeEntry;
+};
+
+app.get('/startReview/:JIRATicketId', async (req, res) => {
+  const { JIRATicketId } = req.params;
+  const { data: clients } = await togglClient.get('/clients');
+  const { id: clientId } = _.find(clients, ['name', 'AlTayer']);
+  const { data: projects } = await togglClient.get(`clients/${clientId}/projects`);
+  const { id: pid } = _.find(projects, ['name', 'Ounass']);
+  const { data: tasks } = await togglClient.get(`/projects/${pid}/tasks`);
+  const { id: existingTaskId } = _.find(tasks, ['name', JIRATicketId]) || {};
+  let tid = existingTaskId;
+  console.log('Existing task id', tid);
+  if (!existingTaskId) {
+    const { data: { data: { id: newTaskId } } } = await togglClient.post('/tasks', {
+      task: {
+        name: JIRATicketId,
+        pid,
+      },
+    });
+    tid = newTaskId;
+    console.log('New task id', tid);
+  }
+  console.log('Task id', tid);
+  const { data: timeEntry } = await togglClient.post('/time_entries/start', {
+    time_entry: {
+      description: 'Reviewing',
+      pid,
+      tid,
+      tags: ['Code Review'],
+      created_with: 'curl',
+    },
+  });
+  res.json(timeEntry);
+});
+
+app.get('/stopReview', async (req, res) => {
+  await stopRunningTimeEntry();
+  res.json({});
+});
+
+app.get('/declineMR/:JIRATicketId', async (req, res) => {
+  try {
+    await stopRunningTimeEntry({ description: 'Declined' });
+  } catch (err) {}
+
+  const { JIRATicketId } = req.params;
+  const {
+    data: {
+      issues: [{
+        changelog: { histories },
+      }],
+    },
+  } = await JIRAClient.get('/search', {
+    params: {
+      jql: `key in ('${JIRATicketId}')`,
+      expand: 'changelog',
+      fields: 'status,assignee,transitions',
+    },
+  });
+  const {
+    author: {
+      accountId,
+    },
+  } = histories.find(({ items }) => !!items.find(({ field, fromString, toString }) => (
+    field === 'status' && fromString === 'Backlog' && toString === 'In Development'
+  )));
+  const { data: { transitions } } = await JIRAClient.get(`issue/${JIRATicketId}/transitions`);
+  const { id: transitionId } = _.find(transitions, ['name', 'Code Review Failed'])
+    || _.find(transitions, ['name', 'Decline'])
+    || {};
+  await JIRAClient.put(`/issue/${JIRATicketId}`, {
+    update: {
+      assignee: [
+        { set: { id: accountId } },
+      ],
+    },
+  });
+  await JIRAClient.post(`/issue/${JIRATicketId}/transitions`, {
+    transition: { id: transitionId },
+  });
+
+  res.json({});
+});
+
+app.get('/acceptMR/:JIRATicketId', async (req, res) => {
+  await stopRunningTimeEntry({ description: 'Merged' });
+
+  const { JIRATicketId } = req.params;
+  const { data: [{ accountId }] } = await JIRAClient.get('/user/search?username=%rana waqar%');
+  await JIRAClient.put(`/issue/${JIRATicketId}`, {
+    update: {
+      assignee: [
+        { set: { id: accountId } },
+      ],
+      labels: [
+        { add: 'nis-beta' },
+      ],
+    },
+  });
+  const { data: { transitions } } = await JIRAClient.get(`issue/${JIRATicketId}/transitions`);
+  const { id: transitionId } = _.find(transitions, ['name', 'Accept']) || {};
+  await JIRAClient.post(`/issue/${JIRATicketId}/transitions`, {
+    transition: { id: transitionId },
+  });
+
+  res.json({});
+});
+
 const nextApp = next({ dev: process.env.NODE_ENV !== 'production' });
 const nextRequestHandler = nextApp.getRequestHandler();
 
 app.use((req, res) => {
   nextRequestHandler(req, res, parse(req.url, true));
+});
+
+app.use((err, req, res, next) => {
+  console.log(err);
+  res.status(500).send({ m: err.message, s: err.stack });
 });
 
 nextApp.prepare().then(() => {
