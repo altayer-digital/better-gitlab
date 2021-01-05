@@ -11,7 +11,7 @@
   "author": "Furqan Zafar",
   "dependencies": {
     "@zeit/next-less": "^1.0.1",
-    "axios": "^0.18.0",
+    "axios": "^0.21.1",
     "bluebird": "^3.5.4",
     "body-parser": "^1.18.3",
     "connect-redis": "^3.4.1",
